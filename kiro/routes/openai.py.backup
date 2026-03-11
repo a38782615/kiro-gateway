@@ -1,0 +1,891 @@
+# -*- coding: utf-8 -*-
+"""
+FastAPI routes for OpenAI and Anthropic compatible APIs.
+
+Contains:
+- OpenAI endpoints: /v1/models, /v1/chat/completions, /v1/responses
+- Anthropic endpoints: /v1/messages
+
+Supports multiple providers (Kiro, GLM) with automatic routing based on model name.
+"""
+
+import json
+import time
+from typing import Optional
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request, Security, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import APIKeyHeader
+from loguru import logger
+from pydantic import BaseModel, Field
+
+from kiro.core.auth import AccountManager
+from kiro.core.cache import ModelInfoCache
+from kiro.core.provider_router import ProviderRouter
+from kiro.models.api import (
+    AnthropicMessagesRequest,
+    AnthropicMessagesResponse,
+    AnthropicErrorResponse,
+    AnthropicErrorDetail,
+    AnthropicMessage,
+)
+from kiro.converters.kiro import anthropic_to_kiro
+from kiro.streaming.kiro import (
+    stream_kiro_to_anthropic,
+    collect_anthropic_response,
+)
+from kiro.core.http_client import KiroHttpClient
+from kiro.utils_pkg.helpers import generate_conversation_id
+from kiro.utils_pkg.tokenizer import count_tools_tokens
+
+# Import debug_logger
+try:
+    from kiro.utils_pkg.debug_logger import debug_logger
+except ImportError:
+    debug_logger = None
+
+
+# --- Security schemes ---
+# OpenAI: Authorization: Bearer
+api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+# Anthropic: x-api-key or Authorization: Bearer
+anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+auth_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+
+# --- Authentication functions ---
+async def verify_api_key(
+    authorization: Optional[str] = Depends(api_key_header),
+    request: Request = None
+) -> int:
+    """
+    Verify API key for OpenAI API against database.
+    
+    Args:
+        authorization: Value from Authorization header
+        request: FastAPI Request for accessing app.state
+    
+    Returns:
+        API key ID if valid
+    
+    Raises:
+        HTTPException: 401 if key is invalid or missing
+    """
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+    
+    if not token:
+        logger.warning("Access attempt without API key (OpenAI API)")
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": {
+                    "message": "Invalid or missing API key. Use Authorization: Bearer header.",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key"
+                }
+            }
+        )
+    
+    # Verify against database
+    manager = request.app.state.auth_manager if request else None
+    if manager:
+        api_key = manager.get_api_key_by_token(token)
+        if api_key:
+            return api_key.id
+    
+    logger.warning("Access attempt with invalid API key (OpenAI endpoint)")
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "error": {
+                "message": "Invalid API key provided.",
+                "type": "invalid_request_error",
+                "code": "invalid_api_key"
+            }
+        }
+    )
+
+
+async def verify_anthropic_api_key(
+    x_api_key: Optional[str] = Security(anthropic_api_key_header),
+    authorization: Optional[str] = Security(auth_header),
+    request: Request = None
+) -> int:
+    """
+    Verify API key for Anthropic API against database.
+    
+    Supports two authentication methods:
+    1. x-api-key header (Anthropic native)
+    2. Authorization: Bearer header (for compatibility)
+    
+    Args:
+        x_api_key: Value from x-api-key header
+        authorization: Value from Authorization header
+        request: FastAPI Request for accessing app.state
+    
+    Returns:
+        API key ID if valid
+    
+    Raises:
+        HTTPException: 401 if key is invalid or missing
+    """
+    # Check x-api-key first (Anthropic native)
+    token = None
+    if x_api_key:
+        token = x_api_key
+    elif authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+    
+    if not token:
+        logger.warning("Access attempt without API key (Anthropic API).")
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "type": "error",
+                "error": {
+                    "type": "authentication_error",
+                    "message": "Invalid or missing API key. Use x-api-key header or Authorization: Bearer."
+                }
+            }
+        )
+    
+    # Verify against database and get API key object
+    manager = request.app.state.auth_manager if request else None
+    if manager:
+        api_key = manager.get_api_key_by_token(token)
+        if api_key:
+            return api_key.id
+    
+    logger.warning("Access attempt with invalid API key (Anthropic endpoint)")
+    raise HTTPException(
+        status_code=401,
+        detail={
+            "type": "error",
+            "error": {
+                "type": "authentication_error",
+                "message": "Invalid or missing API key. Use x-api-key header or Authorization: Bearer."
+            }
+        }
+    )
+
+
+# --- Pydantic Models ---
+class ChatMessage(BaseModel):
+    """Chat message in OpenAI format."""
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    """OpenAI chat completion request."""
+    model: str
+    messages: list
+    stream: Optional[bool] = True
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    tools: Optional[list] = None
+
+
+# --- Router ---
+router = APIRouter(tags=["API"])
+
+
+# ==================== OpenAI Endpoints ====================
+
+@router.get("/v1/models")
+async def list_models(
+    request: Request,
+    api_key_id: int = Depends(verify_api_key)
+):
+    """
+    List available models from all providers.
+    
+    Returns models from:
+    - Kiro (dynamically fetched + hidden models)
+    - GLM (static list)
+    
+    Returns:
+        JSON response with model list in OpenAI format
+    """
+    logger.info("Request to /v1/models")
+    
+    model_resolver = request.app.state.model_resolver
+    
+    # Get all available models (Kiro + hidden + aliases)
+    kiro_models = model_resolver.get_available_models()
+    
+    # Get GLM models
+    from kiro.providers.glm_provider import GLMProvider
+    glm_provider = GLMProvider()
+    glm_models = glm_provider.get_supported_models()
+    
+    # Combine all models
+    all_models = list(set(kiro_models + glm_models))
+    all_models.sort()
+    
+    # Format as OpenAI model list
+    models_data = [
+        {
+            "id": model_id,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "kiro-gateway"
+        }
+        for model_id in all_models
+    ]
+    
+    logger.info(f"Returning {len(models_data)} models")
+    
+    return {
+        "object": "list",
+        "data": models_data
+    }
+
+
+@router.post("/v1/chat/completions")
+async def chat_completions(
+    request: Request,
+    request_data: ChatCompletionRequest,
+    api_key_id: int = Depends(verify_api_key)
+):
+    """
+    OpenAI-compatible chat completions endpoint with multi-provider support.
+    
+    Supports automatic routing:
+    - GLM models (glm-*) → GLMProvider
+    - Other models (claude-*, auto) → Kiro (via Anthropic endpoint conversion)
+    
+    Args:
+        request: FastAPI Request
+        request_data: Chat completion request
+        api_key_id: Verified API key ID
+    
+    Returns:
+        StreamingResponse for streaming mode
+        JSONResponse for non-streaming mode
+    """
+    logger.info(
+        f"Request to /v1/chat/completions (model={request_data.model}, "
+        f"stream={request_data.stream})"
+    )
+    
+    start_time = time.time()
+    
+    auth_manager: AccountManager = request.app.state.auth_manager
+    
+    # Initialize provider router
+    model_cache: ModelInfoCache = request.app.state.model_cache
+    provider_router = ProviderRouter(auth_manager, model_cache)
+    
+    try:
+        # Route to appropriate provider and get account
+        provider, account = await provider_router.route_request(request_data.model)
+        
+        logger.info(
+            f"Routed to provider '{provider.name}' with account {account.id}"
+        )
+        
+        # Use provider's chat_openai() method for all providers
+        if request_data.stream:
+            # Streaming response
+            return StreamingResponse(
+                provider.chat_openai(
+                    account=account,
+                    model=request_data.model,
+                    messages=request_data.messages,
+                    stream=True,
+                    temperature=request_data.temperature,
+                    max_tokens=request_data.max_tokens,
+                    tools=request_data.tools
+                ),
+                media_type="text/event-stream"
+            )
+        else:
+            # Non-streaming response
+            chunks = []
+            async for chunk in provider.chat_openai(
+                account=account,
+                model=request_data.model,
+                messages=request_data.messages,
+                stream=False,
+                temperature=request_data.temperature,
+                max_tokens=request_data.max_tokens,
+                tools=request_data.tools
+            ):
+                chunks.append(chunk)
+            
+            response_data = b"".join(chunks)
+            return JSONResponse(
+                content=json.loads(response_data.decode("utf-8")),
+                media_type="application/json"
+            )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Error in chat_completions: {e}")
+        duration_ms = int((time.time() - start_time) * 1000)
+        
+        # Log the error
+        try:
+            auth_manager.log_request(
+                api_key_id=api_key_id,
+                account_id=account.id if 'account' in locals() else None,
+                model=request_data.model,
+                input_tokens=0,
+                output_tokens=0,
+                status="error",
+                channel="openai",
+                duration_ms=duration_ms
+            )
+        except Exception as log_error:
+            logger.error(f"Failed to log error: {log_error}")
+        
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "message": str(e),
+                    "type": "internal_error"
+                }
+            }
+        )
+
+
+@router.post("/v1/responses")
+async def responses(
+    request: Request,
+    request_data: ChatCompletionRequest,
+    api_key_id: int = Depends(verify_api_key)
+):
+    """
+    OpenAI /v1/responses endpoint with multi-provider support.
+    
+    This endpoint is an alias for /v1/chat/completions for compatibility.
+    
+    Supports automatic routing:
+    - GLM models (glm-*) → GLMProvider
+    - Other models (claude-*, auto) → Kiro
+    
+    Args:
+        request: FastAPI Request
+        request_data: Chat completion request
+        api_key_id: Verified API key ID
+    
+    Returns:
+        StreamingResponse for streaming mode
+        JSONResponse for non-streaming mode
+    """
+    logger.info(
+        f"Request to /v1/responses (model={request_data.model}, "
+        f"stream={request_data.stream})"
+    )
+    
+    # Forward to chat_completions endpoint
+    return await chat_completions(request, request_data, api_key_id)
+
+
+# ==================== Anthropic Endpoints ====================
+
+@router.post("/v1/messages")
+async def messages(
+    request: Request,
+    request_data: AnthropicMessagesRequest,
+    anthropic_version: Optional[str] = Header(None, alias="anthropic-version"),
+    api_key_id: int = Depends(verify_anthropic_api_key)
+):
+    """
+    Anthropic Messages API endpoint with multi-provider support.
+    
+    Supports automatic routing:
+    - GLM models (glm-*) → GLMProvider
+    - Other models (claude-*, auto) → Kiro (existing logic)
+    
+    Required headers:
+    - x-api-key: Your API key (or Authorization: Bearer)
+    - anthropic-version: API version (optional, for compatibility)
+    - Content-Type: application/json
+    
+    Args:
+        request: FastAPI Request for accessing app.state
+        request_data: Request in Anthropic MessagesRequest format
+        anthropic_version: Anthropic API version header (optional)
+    
+    Returns:
+        StreamingResponse for streaming mode (SSE)
+        JSONResponse for non-streaming mode
+    
+    Raises:
+        HTTPException: On validation or API errors
+    """
+    logger.info(f"Request to /v1/messages (model={request_data.model}, stream={request_data.stream})")
+    
+    # Record start time for duration tracking
+    start_time = time.time()
+    
+    if anthropic_version:
+        logger.debug(f"Anthropic-Version header: {anthropic_version}")
+    
+    auth_manager: AccountManager = request.app.state.auth_manager
+    model_cache: ModelInfoCache = request.app.state.model_cache
+    
+    # Check if this is a GLM model request
+    if request_data.model.startswith("glm-"):
+        logger.info(f"Routing GLM model '{request_data.model}' to GLMProvider")
+        
+        # Import provider router
+        from kiro.core.provider_router import ProviderRouter
+        from kiro.converters.helpers import anthropic_to_unified_messages
+        
+        provider_router = ProviderRouter(auth_manager, model_cache)
+        
+        try:
+            # Route to GLM provider
+            provider, account = await provider_router.route_request(request_data.model)
+            
+            # Convert Anthropic messages to simple format for GLM
+            messages = anthropic_to_unified_messages(request_data.messages)
+            
+            if request_data.stream:
+                # Streaming response - convert GLM SSE to Anthropic SSE
+                async def glm_to_anthropic_stream():
+                    """Convert GLM OpenAI-format stream to Anthropic format."""
+                    message_id = f"msg_{int(time.time() * 1000)}"
+                    
+                    # Send message_start event
+                    yield f'event: message_start\ndata: {json.dumps({"type": "message_start", "message": {"id": message_id, "type": "message", "role": "assistant", "content": [], "model": request_data.model}})}\n\n'
+                    
+                    # Send content_block_start
+                    yield f'event: content_block_start\ndata: {json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})}\n\n'
+                    
+                    # Stream content
+                    async for chunk in provider.chat(
+                        account=account,
+                        model=request_data.model,
+                        messages=messages,
+                        stream=True,
+                        temperature=request_data.temperature,
+                        max_tokens=request_data.max_tokens
+                    ):
+                        # Parse OpenAI chunk
+                        chunk_str = chunk.decode('utf-8')
+                        if chunk_str.startswith('data: '):
+                            data_str = chunk_str[6:].strip()
+                            if data_str and data_str != '[DONE]':
+                                try:
+                                    data = json.loads(data_str)
+                                    content = data.get('choices', [{}])[0].get('delta', {}).get('content', '')
+                                    if content:
+                                        # Send content_block_delta
+                                        yield f'event: content_block_delta\ndata: {json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": content}})}\n\n'
+                                except:
+                                    pass
+                    
+                    # Send content_block_stop
+                    yield f'event: content_block_stop\ndata: {json.dumps({"type": "content_block_stop", "index": 0})}\n\n'
+                    
+                    # Send message_stop
+                    yield f'event: message_stop\ndata: {json.dumps({"type": "message_stop"})}\n\n'
+                
+                return StreamingResponse(
+                    glm_to_anthropic_stream(),
+                    media_type="text/event-stream"
+                )
+            else:
+                # Non-streaming response
+                chunks = []
+                async for chunk in provider.chat(
+                    account=account,
+                    model=request_data.model,
+                    messages=messages,
+                    stream=False,
+                    temperature=request_data.temperature,
+                    max_tokens=request_data.max_tokens
+                ):
+                    chunks.append(chunk)
+                
+                response_data = json.loads(b"".join(chunks).decode("utf-8"))
+                
+                # Convert OpenAI response to Anthropic format
+                content_text = response_data.get('choices', [{}])[0].get('message', {}).get('content', '')
+                
+                return {
+                    "id": f"msg_{int(time.time() * 1000)}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": content_text}],
+                    "model": request_data.model,
+                    "stop_reason": "end_turn",
+                    "usage": response_data.get('usage', {})
+                }
+        
+        except Exception as e:
+            logger.exception(f"Error routing to GLM: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": str(e)}
+                }
+            )
+    
+    # For Kiro models, use existing logic below
+    # Note: prepare_new_request() and log_request_body() are now called by DebugLoggerMiddleware
+    # This ensures debug logging works even for requests that fail Pydantic validation (422 errors)
+    
+    # Check for truncation recovery opportunities
+    from kiro.utils_pkg.truncation_state import get_tool_truncation, get_content_truncation
+    from kiro.utils_pkg.truncation_recovery import generate_truncation_tool_result, generate_truncation_user_message
+    from kiro.models.api import AnthropicMessage
+    
+    modified_messages = []
+    tool_results_modified = 0
+    content_notices_added = 0
+    
+    for msg in request_data.messages:
+        # Check if this is a user message with tool_result blocks
+        if msg.role == "user" and msg.content and isinstance(msg.content, list):
+            modified_content_blocks = []
+            has_modifications = False
+            
+            for block in msg.content:
+                # Handle both dict and Pydantic objects (ToolResultContentBlock)
+                if isinstance(block, dict):
+                    block_type = block.get("type")
+                    tool_use_id = block.get("tool_use_id")
+                    original_content = block.get("content", "")
+                elif hasattr(block, "type"):
+                    block_type = block.type
+                    tool_use_id = getattr(block, "tool_use_id", None)
+                    original_content = getattr(block, "content", "")
+                else:
+                    modified_content_blocks.append(block)
+                    continue
+                
+                if block_type == "tool_result" and tool_use_id:
+                    truncation_info = get_tool_truncation(tool_use_id)
+                    if truncation_info:
+                        # Modify tool_result content to include truncation notice
+                        synthetic = generate_truncation_tool_result(
+                            tool_name=truncation_info.tool_name,
+                            tool_use_id=tool_use_id,
+                            truncation_info=truncation_info.truncation_info
+                        )
+                        # Prepend truncation notice to original content
+                        modified_content = f"{synthetic['content']}\n\n---\n\nOriginal tool result:\n{original_content}"
+                        
+                        # Create modified block (handle both dict and Pydantic)
+                        if isinstance(block, dict):
+                            modified_block = block.copy()
+                            modified_block["content"] = modified_content
+                        else:
+                            # Pydantic object - use model_copy
+                            modified_block = block.model_copy(update={"content": modified_content})
+                        
+                        modified_content_blocks.append(modified_block)
+                        tool_results_modified += 1
+                        has_modifications = True
+                        logger.debug(f"Modified tool_result for {tool_use_id} to include truncation notice")
+                        continue
+                
+                modified_content_blocks.append(block)
+            
+            # Create NEW AnthropicMessage object if modifications were made (Pydantic immutability)
+            if has_modifications:
+                modified_msg = msg.model_copy(update={"content": modified_content_blocks})
+                modified_messages.append(modified_msg)
+                continue  # Skip normal append since we already added modified version
+        
+        # Check if this is an assistant message with truncated content
+        if msg.role == "assistant" and msg.content:
+            # Extract text content for hash check
+            text_content = ""
+            if isinstance(msg.content, str):
+                text_content = msg.content
+            elif isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_content += block.get("text", "")
+            
+            if text_content:
+                truncation_info = get_content_truncation(text_content)
+                if truncation_info:
+                    # Add this message first
+                    modified_messages.append(msg)
+                    # Then add synthetic user message about truncation
+                    synthetic_user_msg = AnthropicMessage(
+                        role="user",
+                        content=[{"type": "text", "text": generate_truncation_user_message()}]
+                    )
+                    modified_messages.append(synthetic_user_msg)
+                    content_notices_added += 1
+                    logger.debug(f"Added truncation notice after assistant message (hash: {truncation_info.message_hash})")
+                    continue  # Skip normal append since we already added it
+        
+        modified_messages.append(msg)
+    
+    if tool_results_modified > 0 or content_notices_added > 0:
+        request_data.messages = modified_messages
+        logger.info(f"Truncation recovery: modified {tool_results_modified} tool_result(s), added {content_notices_added} content notice(s)")
+    
+    # Generate conversation ID for Kiro API (random UUID, not used for tracking)
+    conversation_id = generate_conversation_id()
+    
+    # Get token and account for this request
+    try:
+        token, account = await auth_manager.get_access_token()
+    except RuntimeError as e:
+        return JSONResponse(
+            status_code=503,
+            content={"type": "error", "error": {"type": "overloaded_error", "message": str(e)}}
+        )
+
+    # profileArn from account config (optional)
+    profile_arn_for_payload = (
+        account.config.get("profileArn") or account.config.get("profile_arn") or ""
+    )
+    
+    try:
+        kiro_payload = anthropic_to_kiro(
+            request_data,
+            conversation_id,
+            profile_arn_for_payload
+        )
+    except ValueError as e:
+        logger.error(f"Conversion error: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": str(e)
+                }
+            }
+        )
+    
+    # Log Kiro payload
+    try:
+        kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
+        if debug_logger:
+            debug_logger.log_kiro_request_body(kiro_request_body)
+    except Exception as e:
+        logger.warning(f"Failed to log Kiro request: {e}")
+    
+    # Build Kiro API URL from account region
+    region = account.config.get("region", "us-east-1")
+    url = f"https://q.{region}.amazonaws.com/generateAssistantResponse"
+    logger.debug(f"Kiro API URL: {url}")
+
+    if request_data.stream:
+        http_client = KiroHttpClient(auth_manager, account, shared_client=None)
+    else:
+        shared_client = request.app.state.http_client
+        http_client = KiroHttpClient(auth_manager, account, shared_client=shared_client)
+    
+    # Prepare data for token counting
+    # Convert Pydantic models to dicts for tokenizer
+    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+    tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+    
+    try:
+        # Make request to Kiro API (for both streaming and non-streaming modes)
+        # Important: we wait for Kiro response BEFORE returning StreamingResponse,
+        # so that we can return proper HTTP error codes if Kiro fails
+        response = await http_client.request_with_retry(
+            "POST",
+            url,
+            kiro_payload,
+            stream=True
+        )
+        
+        if response.status_code != 200:
+            try:
+                error_content = await response.aread()
+            except Exception:
+                error_content = b"Unknown error"
+            
+            await http_client.close()
+            error_text = error_content.decode('utf-8', errors='replace')
+            
+            # Try to parse JSON response from Kiro to extract error message
+            error_message = error_text
+            try:
+                error_json = json.loads(error_text)
+                # Enhance Kiro API errors with user-friendly messages
+                from kiro.kiro_errors import enhance_kiro_error
+                error_info = enhance_kiro_error(error_json)
+                error_message = error_info.user_message
+                # Log original error for debugging
+                logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
+            except (json.JSONDecodeError, KeyError):
+                pass
+            
+            # Log access log for error (before flush, so it gets into app_logs)
+            logger.warning(
+                f"HTTP {response.status_code} - POST /v1/messages - {error_message[:100]}"
+            )
+            
+            # Flush debug logs on error
+            if debug_logger:
+                debug_logger.flush_on_error(response.status_code, error_message)
+            
+            # Return error in Anthropic format
+            return JSONResponse(
+                status_code=response.status_code,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": error_message
+                    }
+                }
+            )
+        
+        if request_data.stream:
+            # Streaming mode - Kiro already returned 200, now stream the response
+            # Track usage for logging
+            final_usage = {"input_tokens": 0, "output_tokens": 0}
+            
+            async def stream_wrapper():
+                nonlocal final_usage
+                streaming_error = None
+                client_disconnected = False
+                try:
+                    async for chunk in stream_kiro_to_anthropic(
+                        response,
+                        request_data.model,
+                        model_cache,
+                        auth_manager,
+                        account,
+                        request_messages=messages_for_tokenizer
+                    ):
+                        # Extract usage from message_delta event
+                        if chunk.startswith("event: message_delta"):
+                            try:
+                                import json
+                                lines = chunk.split('\n')
+                                for line in lines:
+                                    if line.startswith("data: "):
+                                        data = json.loads(line[6:])
+                                        if "usage" in data:
+                                            final_usage = data["usage"]
+                            except:
+                                pass
+                        yield chunk
+                except GeneratorExit:
+                    client_disconnected = True
+                    logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
+                except Exception as e:
+                    streaming_error = e
+                    # Send error event to client, then gracefully end the stream
+                    try:
+                        error_event = f'event: error\ndata: {json.dumps({"type": "error", "error": {"type": "api_error", "message": str(e)}})}\n\n'
+                        yield error_event
+                    except Exception:
+                        pass
+                finally:
+                    await http_client.close()
+                    if streaming_error:
+                        error_type = type(streaming_error).__name__
+                        error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
+                        logger.error(f"HTTP 500 - POST /v1/messages (streaming) - [{error_type}] {error_msg[:100]}")
+                    elif client_disconnected:
+                        logger.info(f"HTTP 200 - POST /v1/messages (streaming) - client disconnected")
+                    else:
+                        logger.info(f"HTTP 200 - POST /v1/messages (streaming) - completed")
+                    
+                    # Log request to database
+                    try:
+                        duration_ms = int((time.time() - start_time) * 1000)
+                        auth_manager.log_request(
+                            api_key_id=api_key_id,
+                            account_id=account.id if account else None,
+                            model=request_data.model,
+                            input_tokens=final_usage.get("input_tokens", 0),
+                            output_tokens=final_usage.get("output_tokens", 0),
+                            status="error" if streaming_error else "success",
+                            channel="anthropic",
+                            duration_ms=duration_ms
+                        )
+                    except Exception as log_error:
+                        logger.warning(f"Failed to log streaming request: {log_error}")
+                    
+                    if debug_logger:
+                        if streaming_error:
+                            debug_logger.flush_on_error(500, str(streaming_error))
+                        else:
+                            debug_logger.discard_buffers()
+            
+            return StreamingResponse(
+                stream_wrapper(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                }
+            )
+        
+        else:
+            # Non-streaming mode - collect entire response
+            anthropic_response = await collect_anthropic_response(
+                response,
+                request_data.model,
+                model_cache,
+                auth_manager,
+                request_messages=messages_for_tokenizer
+            )
+            
+            await http_client.close()
+            
+            logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")
+            
+            # Log request to database
+            try:
+                duration_ms = int((time.time() - start_time) * 1000)
+                usage = anthropic_response.get("usage", {})
+                auth_manager.log_request(
+                    api_key_id=api_key_id,
+                    account_id=account.id if account else None,
+                    model=request_data.model,
+                    input_tokens=usage.get("input_tokens", 0),
+                    output_tokens=usage.get("output_tokens", 0),
+                    status="success",
+                    channel="anthropic",
+                    duration_ms=duration_ms
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log request: {log_error}")
+            
+            if debug_logger:
+                debug_logger.discard_buffers()
+            
+            return JSONResponse(content=anthropic_response)
+    
+    except HTTPException as e:
+        await http_client.close()
+        logger.error(f"HTTP {e.status_code} - POST /v1/messages - {e.detail}")
+        if debug_logger:
+            debug_logger.flush_on_error(e.status_code, str(e.detail))
+        raise
+    except Exception as e:
+        await http_client.close()
+        logger.error(f"Internal error: {e}", exc_info=True)
+        logger.error(f"HTTP 500 - POST /v1/messages - {str(e)[:100]}")
+        if debug_logger:
+            debug_logger.flush_on_error(500, str(e))
+        
+        return JSONResponse(
+            status_code=500,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": f"Internal Server Error: {str(e)}"
+                }
+            }
+        )
